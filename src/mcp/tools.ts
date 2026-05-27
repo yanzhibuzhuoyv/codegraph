@@ -1427,21 +1427,23 @@ export class ToolHandler {
         );
       }
 
+      // Track which node IDs we've already inlined a body for so we don't
+      // double-emit when a callee of FROM is also surfaced separately.
+      const inlinedBodies = new Set<string>();
+      const inlineBody = (n: Node, lineCap: number, charCap: number): boolean => {
+        if (inlinedBodies.has(n.id)) return false;
+        inlinedBodies.add(n.id);
+        const body = this.sourceRangeAt(cg, n.filePath, n.startLine, n.endLine, fileCache, lineCap, charCap);
+        if (body) { lines.push(body); return true; }
+        return false;
+      };
+
       const inlineEndpoint = (
         label: 'FROM' | 'TO',
         node: Node,
-        // calls/callers caps are tight on purpose — the full bodies are what
-        // displaces the Read; the lists are just enough hint to follow if needed.
       ) => {
         lines.push(`### ${label}: \`${node.name}\` (${node.filePath}:${node.startLine}-${node.endLine})`);
-        // Modest endpoint-source cap (120 lines / 3600 chars). Earlier bumped to
-        // 200/6000 to fit cosmos-gov's 261-line EndBlocker without truncation,
-        // but the n=2 audit showed the agent re-Reads regardless — so the extra
-        // characters were pure cost without payoff. 120/3600 captures most
-        // real-world endpoint bodies (the gRPC stubs / module Begin/EndBlocker
-        // wrappers we typically land on are short) at half the token weight.
-        const body = this.sourceRangeAt(cg, node.filePath, node.startLine, node.endLine, fileCache, 120, 3600);
-        if (body) lines.push(body);
+        inlineBody(node, 120, 3600);
         const callers = cg.getCallers(node.id).slice(0, 6);
         if (callers.length > 0) {
           lines.push(`**Callers of \`${node.name}\`:** ` +
@@ -1457,8 +1459,54 @@ export class ToolHandler {
       inlineEndpoint('FROM', start);
       if (end.id !== start.id) inlineEndpoint('TO', end);
 
+      // Inline the OTHER top-level functions/methods in TO's file — that's
+      // where the missing dynamic-dispatch flow usually lives. Concrete
+      // measurement from cosmos-Q1: `msgServer.Send` statically calls only
+      // utility functions (`StringToBytes`, `Wrapf`); its real next-hop
+      // `SendCoins` is invoked via an embedded-interface call (`k.Keeper.SendCoins`)
+      // that static parsing CAN'T see. The flow IS in the same file as the
+      // destination (`x/bank/keeper/send.go`: SendCoins → subUnlockedCoins →
+      // addCoins → setBalance). Pre-inlining those file-mates is what
+      // replaces the agent's "trace fail → search SendCoins → node SendCoins
+      // → trace again" fan-out.
+      const NEIGHBOR_LINES = 40;
+      const NEIGHBOR_CHARS = 1200;
+      const NEIGHBOR_K = 5;
+      const fileSiblings = (anchor: Node): Node[] => {
+        // Functions and methods in the same file as the anchor, excluding
+        // the anchor itself and anything we've already inlined. Sort by
+        // distance from the anchor's startLine so the closest symbols come
+        // first (the flow is usually adjacent in the file).
+        const sameFile = cg
+          .getNodesByKind('function')
+          .filter((n) => n.filePath === anchor.filePath)
+          .concat(
+            cg.getNodesByKind('method').filter((n) => n.filePath === anchor.filePath),
+          );
+        return sameFile
+          .filter((n) => n.id !== anchor.id && !inlinedBodies.has(n.id))
+          .sort((a, b) =>
+            Math.abs(a.startLine - anchor.startLine) - Math.abs(b.startLine - anchor.startLine),
+          )
+          .slice(0, NEIGHBOR_K);
+      };
+      const renderSiblings = (label: string, siblings: Node[]) => {
+        if (siblings.length === 0) return;
+        lines.push(`### ${label}`);
+        for (const sib of siblings) {
+          lines.push('');
+          lines.push(`- \`${sib.name}\` (${sib.filePath}:${sib.startLine}-${sib.endLine})`);
+          inlineBody(sib, NEIGHBOR_LINES, NEIGHBOR_CHARS);
+        }
+        lines.push('');
+      };
+      renderSiblings(
+        `Other functions in \`${end.filePath}\` (the flow that the dynamic-dispatch hop reaches — bodies inlined)`,
+        fileSiblings(end),
+      );
+
       lines.push(
-        '> Both endpoint bodies, callers, and callees are inlined above. The dynamic-dispatch hop typically appears in one of them as: a callback registration, an interface method invoked on a field, a framework hook, or a generated stub. Identify the gap from the bodies — no further codegraph_node/Read is needed for these symbols.',
+        '> Endpoint bodies + the other functions in the destination\'s file are inlined above. Together they typically cover the missing dynamic-dispatch boundary (interface-method calls like `k.Keeper.SendCoins` that static parsing can\'t follow). **No further codegraph_node / codegraph_callers / codegraph_callees / Read / Grep is needed for any symbol already shown here** — call them again only if you need to walk DEEPER than what is inlined.',
       );
       return this.textResult(this.truncateOutput(lines.join('\n') + fromMatches.note + toMatches.note));
     }
