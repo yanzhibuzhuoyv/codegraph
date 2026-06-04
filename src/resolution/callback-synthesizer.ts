@@ -906,6 +906,14 @@ const RN_SWIFT_SEND_RE = /\bsendEvent\s*\(\s*withName\s*:\s*"([^"]+)"/g;
 // JVM source files in the consumer so we don't re-process JS emits
 // (which `eventEmitterEdges` already handles).
 const RN_JVM_EMIT_RE = /\.emit\s*\(\s*"([^"]+)"\s*,/g;
+// Custom `sendEvent(reactContext, "X", body)` wrapper — extremely common
+// (react-native-device-info and many libs wrap `DeviceEventManagerModule…emit`
+// behind a helper whose `.emit(eventName, …)` uses a VARIABLE, so RN_JVM_EMIT_RE
+// misses it; the literal lives in the wrapper CALL instead). Captures the first
+// string literal inside a `sendEvent(...)` call. `[^;{}]*?` keeps it on one
+// statement and stops at a block boundary, so the wrapper DEFINITION (whose `(`
+// is followed by `… ) {`) never matches. Multi-line tolerant. (java/kotlin/swift)
+const RN_NATIVE_SENDEVENT_RE = /\bsendEvent\s*\([^;{}]*?"([^"]+)"/g;
 
 function rnEventEdges(ctx: ResolutionContext): Edge[] {
   // Native dispatchers (source = the native method whose body sends the
@@ -945,15 +953,24 @@ function rnEventEdges(ctx: ResolutionContext): Edge[] {
       while ((m = RN_SWIFT_SEND_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
       }
+      RN_NATIVE_SENDEVENT_RE.lastIndex = 0;
+      while ((m = RN_NATIVE_SENDEVENT_RE.exec(content))) {
+        if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
     }
 
-    // JVM side: `.emit("X", …)` in Java/Kotlin. (We pattern-match
-    // anywhere in the file; the JS in-language path uses a separate
-    // emitter object pattern and is already handled by eventEmitterEdges.)
+    // JVM side: `.emit("X", …)` in Java/Kotlin, plus the common
+    // `sendEvent(ctx, "X", body)` wrapper. (We pattern-match anywhere in the
+    // file; the JS in-language path uses a separate emitter object pattern and
+    // is already handled by eventEmitterEdges.)
     if (file.endsWith('.java') || file.endsWith('.kt')) {
-      RN_JVM_EMIT_RE.lastIndex = 0;
       let m: RegExpExecArray | null;
+      RN_JVM_EMIT_RE.lastIndex = 0;
       while ((m = RN_JVM_EMIT_RE.exec(content))) {
+        if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
+      RN_NATIVE_SENDEVENT_RE.lastIndex = 0;
+      while ((m = RN_NATIVE_SENDEVENT_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
       }
     }
