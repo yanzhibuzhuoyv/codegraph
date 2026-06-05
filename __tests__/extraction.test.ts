@@ -4257,6 +4257,36 @@ describe('Rust module-path call resolution', () => {
     expect(usersDeps.some((p) => p.endsWith('http/mod.rs')), 'users::router() lands on users.rs').toBe(true);
     expect(profilesDeps.some((p) => p.endsWith('http/mod.rs')), 'profiles::router() lands on profiles.rs').toBe(true);
   });
+
+  it('a 3-segment module-path call (`database::profiles::find()`) resolves to the leaf fn', async () => {
+    // A 2-level module path — the common `db.run(move |c| database::profiles::find(c))`
+    // / `crate::a::b::func()` shape. The reference-resolver pre-filter used to drop any
+    // `a::b::c` whose leaf it never checked (it tested only the first segment and the
+    // `b::c` remainder, neither of which names a symbol), so the call never reached the
+    // Rust path resolver and the leaf module looked dependent-less.
+    const routes = path.join(tempDir, 'src/routes');
+    const database = path.join(tempDir, 'src/database');
+    fs.mkdirSync(routes, { recursive: true });
+    fs.mkdirSync(database, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/lib.rs'), `pub mod routes;\npub mod database;\n`);
+    fs.writeFileSync(path.join(database, 'mod.rs'), `pub mod profiles;\n`);
+    fs.writeFileSync(path.join(database, 'profiles.rs'), `pub fn find(id: i32) -> i32 { id }\n`);
+    fs.writeFileSync(
+      path.join(routes, 'mod.rs'),
+      `use crate::database;\npub fn get_profile(id: i32) -> i32 {\n    database::profiles::find(id)\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const find = cg
+      .getNodesByKind('function')
+      .find((n) => n.name === 'find' && n.filePath.endsWith('database/profiles.rs'));
+    expect(find, 'database/profiles.rs find fn').toBeDefined();
+    const deps = [...cg.getImpactRadius(find!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('routes/mod.rs')), 'database::profiles::find() resolves to the leaf fn').toBe(true);
+  });
 });
 
 describe('Objective-C messages, class receivers, and #import', () => {

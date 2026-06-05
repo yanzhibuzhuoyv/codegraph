@@ -564,6 +564,16 @@ export class ReferenceResolver {
       const receiver = name.substring(0, colonIdx);
       const member = name.substring(colonIdx + 2);
       if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      // Multi-segment path `a::b::c` (a Rust/C++ module call like
+      // `database::profiles::find`) — the only segment that names a symbol is
+      // the last (`c`); `member` above is `b::c`, which never matches a node
+      // name, so without this the pre-filter drops the ref before the Rust path
+      // resolver ever sees it. Mirror the dotted-name leaf check above.
+      const lastColon = name.lastIndexOf('::');
+      if (lastColon > colonIdx) {
+        const tail = name.substring(lastColon + 2);
+        if (tail && this.knownNames.has(tail)) return true;
+      }
     }
 
     // For path-like references (e.g., "snippets/drawer-menu.liquid"), check the filename
